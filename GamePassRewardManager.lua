@@ -9,6 +9,10 @@ print("?? Loading Enhanced Gamepass Rewards Manager v2...")
 -- Data store for tracking granted rewards
 local RewardsDataStore = DataStoreService:GetDataStore("GamepassRewards_v3")
 
+-- Mutex system to prevent race conditions
+local rewardMutex = {} -- [userId] = {gamepassId = timestamp}
+local MUTEX_TIMEOUT = 30 -- seconds
+
 -- Wait for all required systems
 local GamepassRemotes = ReplicatedStorage:WaitForChild("GamepassRemotes", 10)
 local CheckGamepassOwnership = GamepassRemotes and GamepassRemotes:WaitForChild("CheckGamepassOwnership", 5)
@@ -48,7 +52,7 @@ local GAMEPASS_REWARDS = {
 			gears = {
 				{
 					id = "time_stop_sandals_liril",
-					name = "Time-Stop Sandals of Liril�",
+					name = "Time-Stop Sandals of Liril�",
 					rarity = "mythic",
 					luckBoost = 100, -- 2x = +100%
 					rollPenalty = 0,
@@ -137,33 +141,67 @@ local GAMEPASS_REWARDS = {
 	}
 }
 
--- Check if rewards were already granted
+-- Check if rewards were already granted with retry logic
 local function hasReceivedRewards(player, gamepassId)
-	local success, data = pcall(function()
-		local key = "Player_" .. player.UserId
-		return RewardsDataStore:GetAsync(key) or {}
-	end)
-
-	if success and data then
-		return data[tostring(gamepassId)] == true
-	end
-	return false
-end
-
--- Mark rewards as granted
-local function markRewardsGranted(player, gamepassId)
-	spawn(function()
-		local success, err = pcall(function()
+	for attempt = 1, 3 do
+		local success, data = pcall(function()
 			local key = "Player_" .. player.UserId
-			local data = RewardsDataStore:GetAsync(key) or {}
-			data[tostring(gamepassId)] = true
-			RewardsDataStore:SetAsync(key, data)
+			return RewardsDataStore:GetAsync(key) or {}
 		end)
 
-		if not success then
-			warn("? Failed to save reward status for " .. player.Name .. ": " .. tostring(err))
-		else
-			print("? Marked rewards as granted for gamepass " .. gamepassId)
+		if success and data then
+			return data[tostring(gamepassId)] == true
+		end
+		
+		if attempt < 3 then
+			warn("❌ Failed to check reward status (attempt " .. attempt .. "), retrying...")
+			wait(2^attempt) -- Exponential backoff
+		end
+	end
+	
+	warn("❌ Failed to check reward status after 3 attempts for " .. player.Name)
+	return false -- Default to not granted to allow retry later
+end
+
+-- Mark rewards as granted with retry logic and race condition protection
+local function markRewardsGranted(player, gamepassId)
+	spawn(function()
+		for attempt = 1, 3 do
+			local success, err = pcall(function()
+				local key = "Player_" .. player.UserId
+				
+				-- Get current data first to avoid overwriting other gamepass data
+				local data = RewardsDataStore:GetAsync(key) or {}
+				
+				-- Use a timestamp to detect potential race conditions
+				local timestamp = tick()
+				local existingTimestamp = data[tostring(gamepassId) .. "_timestamp"]
+				
+				-- Only update if we don't have a recent timestamp (within 60 seconds)
+				if not existingTimestamp or (timestamp - existingTimestamp) > 60 then
+					data[tostring(gamepassId)] = true
+					data[tostring(gamepassId) .. "_timestamp"] = timestamp
+					RewardsDataStore:SetAsync(key, data)
+					return true
+				else
+					warn("⚠️ Race condition detected - rewards recently granted by another process")
+					return false
+				end
+			end)
+
+			if success and err ~= false then
+				print("✅ Marked rewards as granted for gamepass " .. gamepassId)
+				break
+			elseif success and err == false then
+				-- Race condition detected, this is actually fine
+				print("⚠️ Rewards already being processed by another system")
+				break
+			else
+				warn("❌ Failed to save reward status for " .. player.Name .. " (attempt " .. attempt .. "): " .. tostring(err))
+				if attempt < 3 then
+					wait(2^attempt) -- Exponential backoff
+				end
+			end
 		end
 	end)
 end
@@ -276,12 +314,46 @@ local function grantBrainrots(player, brainrotNames)
 	return true
 end
 
--- Main reward granting function
+-- Main reward granting function with race condition protection
 local function grantGamepassRewards(player, gamepassId)
+	local userId = player.UserId
+	local mutexKey = tostring(userId) .. "_" .. tostring(gamepassId)
+	
+	-- Check mutex to prevent concurrent processing
+	if not rewardMutex[userId] then
+		rewardMutex[userId] = {}
+	end
+	
+	local currentTime = tick()
+	local existingMutex = rewardMutex[userId][gamepassId]
+	
+	if existingMutex and (currentTime - existingMutex) < MUTEX_TIMEOUT then
+		warn("⚠️ Race condition prevented - rewards currently being processed for " .. player.Name .. " gamepass " .. gamepassId)
+		return false
+	end
+	
+	-- Set mutex
+	rewardMutex[userId][gamepassId] = currentTime
+	
+	-- Cleanup function
+	local function cleanup()
+		if rewardMutex[userId] then
+			rewardMutex[userId][gamepassId] = nil
+		end
+	end
+
 	local rewardConfig = GAMEPASS_REWARDS[gamepassId]
 	if not rewardConfig then
 		print("?? No rewards configured for gamepass " .. gamepassId)
-		return
+		cleanup()
+		return false
+	end
+
+	-- Double-check if already granted (race condition protection)
+	if hasReceivedRewards(player, gamepassId) then
+		print("✅ " .. player.Name .. " already received " .. rewardConfig.name .. " rewards (caught race condition)")
+		cleanup()
+		return false
 	end
 
 	print("?? Granting " .. rewardConfig.name .. " rewards to " .. player.Name .. "...")
@@ -363,6 +435,11 @@ local function grantGamepassRewards(player, gamepassId)
 	else
 		warn("? No rewards were successfully granted to " .. player.Name)
 	end
+	
+	-- Clean up mutex
+	cleanup()
+	
+	return allSuccessful
 end
 
 -- Check all gamepass rewards for a player
@@ -412,6 +489,14 @@ Players.PlayerAdded:Connect(function(player)
 		wait(8) -- Extra time for all systems to load
 		checkAllGamepassRewards(player)
 	end)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	-- Clean up mutex data to prevent memory leaks
+	if rewardMutex[player.UserId] then
+		rewardMutex[player.UserId] = nil
+		print("🧹 Cleaned up reward mutex for " .. player.Name)
+	end
 end)
 
 -- Admin commands  
