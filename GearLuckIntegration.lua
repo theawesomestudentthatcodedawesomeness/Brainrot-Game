@@ -165,4 +165,15 @@ onInventoryToggled()
 -- Expose global function for manual updates (with throttling)
 _G.UpdateLuckFromGear = throttledUpdateLuckFromGear
 
-print("Gear Luck Integration loaded - connecting gear system with luck display")
+-- Cleanup connections when player leaves to prevent memory leaks
+Players.PlayerRemoving:Connect(function(leavingPlayer)
+	if leavingPlayer == player then
+		-- Clean up any global references
+		if _G.UpdateLuckFromGear == throttledUpdateLuckFromGear then
+			_G.UpdateLuckFromGear = nil
+		end
+		print("🧹 Cleaned up Gear Luck Integration for " .. player.Name)
+	end
+end)
+
+print("✅ Gear Luck Integration loaded - connecting gear system with luck display")

@@ -515,4 +515,52 @@ end)
 _G.CheckPlayerGamepassRewards = checkAllGamepassRewards
 _G.GrantGamepassRewards = grantGamepassRewards
 
-print("? Enhanced Gamepass Rewards Manager v2 loaded!")
+-- Debug function to check system status
+_G.GetGamepassSystemStatus = function()
+	local mutexCount = 0
+	for userId, mutexData in pairs(rewardMutex) do
+		for _ in pairs(mutexData) do
+			mutexCount = mutexCount + 1
+		end
+	end
+	
+	return {
+		activeGamepasses = 0,
+		mutexEntries = mutexCount,
+		systemsAvailable = {
+			CheckGamepassOwnership = CheckGamepassOwnership ~= nil,
+			GearRemotes = ReplicatedStorage:FindFirstChild("GearRemotes") ~= nil,
+			InventoryRemotes = ReplicatedStorage:FindFirstChild("InventoryRemotes") ~= nil,
+			BrainrotRemotes = BrainrotRemotes ~= nil
+		}
+	}
+end
+
+-- Cleanup mutex system periodically to prevent memory leaks
+spawn(function()
+	while true do
+		wait(300) -- Clean up every 5 minutes
+		local currentTime = tick()
+		local cleanedCount = 0
+		
+		for userId, mutexData in pairs(rewardMutex) do
+			for gamepassId, timestamp in pairs(mutexData) do
+				if currentTime - timestamp > MUTEX_TIMEOUT * 2 then -- Double timeout for safety
+					mutexData[gamepassId] = nil
+					cleanedCount = cleanedCount + 1
+				end
+			end
+			
+			-- Remove empty user entries
+			if next(mutexData) == nil then
+				rewardMutex[userId] = nil
+			end
+		end
+		
+		if cleanedCount > 0 then
+			print("🧹 Cleaned up " .. cleanedCount .. " stale mutex entries")
+		end
+	end
+end)
+
+print("✅ Enhanced Gamepass Rewards Manager v2 loaded!")
